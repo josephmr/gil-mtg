@@ -1,12 +1,11 @@
-use dotenv;
-use futures_util::{Stream, StreamExt};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_repr::*;
 use thiserror::Error;
-use tokio::net::TcpStream;
+use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_tungstenite::{
     connect_async, tungstenite::client::IntoClientRequest, tungstenite::Message as WsMessage,
-    MaybeTlsStream, WebSocketStream,
 };
 
 #[derive(Serialize_repr, Deserialize_repr, PartialEq, Debug)]
@@ -62,54 +61,55 @@ enum Error {
 }
 
 struct Client {
-    pub ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
     token: String,
-}
-
-impl Stream for Client {
-    type Item = Event;
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        match self.ws_stream.poll_next_unpin(cx) {
-            std::task::Poll::Ready(message) => {
-                let message = message.unwrap().unwrap();
-                let event = match message {
-                    WsMessage::Text(message) => {
-                        if let Op { op: OpCode::Event } = serde_json::from_str(&message).unwrap() {
-                            Some(serde_json::from_str::<Message>(&message).unwrap().d)
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                };
-                std::task::Poll::Ready(event)
-            }
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
-    }
 }
 
 type LibResult<T> = core::result::Result<T, Error>;
 
+type Events = UnboundedReceiver<Event>;
+
 impl Client {
     async fn new(token: &str) -> LibResult<Client> {
+        Ok(Client {
+            token: token.to_string(),
+        })
+    }
+
+    // TODO: Use type state to manage connection state (connected|connecting|not_connected)
+    async fn start(&mut self) -> LibResult<Events> {
         let mut req = "wss://api.guilded.gg/v1/websocket"
             .into_client_request()
             .unwrap();
         req.headers_mut().append(
             "Authorization",
-            format!("Bearer {}", token,)
+            format!("Bearer {}", self.token,)
                 .parse()
                 .map_err(|_| Error::InvalidToken)?,
         );
-        let (ws_stream, _) = connect_async(req).await?;
-        Ok(Client {
-            ws_stream,
-            token: token.to_string(),
-        })
+        let (tx, rx) = unbounded_channel();
+
+        let (mut ws_stream, _) = connect_async(req).await?;
+        tokio::spawn(async move {
+            while let Some(message) = ws_stream.next().await {
+                if let Some(event) = Client::parse(message.unwrap()) {
+                    tx.send(event).unwrap();
+                }
+            }
+        });
+        Ok(rx)
+    }
+
+    fn parse(message: tokio_tungstenite::tungstenite::Message) -> Option<Event> {
+        match message {
+            WsMessage::Text(message) => {
+                if let Op { op: OpCode::Event } = serde_json::from_str(&message).unwrap() {
+                    Some(serde_json::from_str::<Message>(&message).unwrap().d)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
     }
 }
 
@@ -118,8 +118,9 @@ async fn main() -> Result<(), anyhow::Error> {
     dotenv::dotenv().ok();
 
     let mut client = Client::new(&std::env::var("GUILDED_BEARER_TOKEN").unwrap()).await?;
+    let mut events = client.start().await?;
     loop {
-        let event = client.next().await;
+        let event = events.recv().await;
         println!("{:?}", event);
     }
 }
