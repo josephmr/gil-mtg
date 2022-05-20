@@ -1,12 +1,14 @@
 use futures_util::StreamExt;
+use mtg::http::{ChatEmbed, UrlWrapper};
 use serde::{Deserialize, Serialize};
 use serde_repr::*;
+use std::sync::Mutex;
 use thiserror::Error;
-use tokio::sync::mpsc::unbounded_channel;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio_tungstenite::{
     connect_async, tungstenite::client::IntoClientRequest, tungstenite::Message as WsMessage,
 };
+use tracing::{debug, error};
 
 #[derive(Serialize_repr, Deserialize_repr, PartialEq, Debug)]
 #[repr(u8)]
@@ -43,7 +45,9 @@ enum Event {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 struct ChatMessage {
+    channel_id: String,
     content: String,
 }
 
@@ -61,6 +65,7 @@ enum Error {
 }
 
 struct Client {
+    sender: Mutex<Option<UnboundedSender<Event>>>,
     token: String,
 }
 
@@ -71,6 +76,7 @@ type Events = UnboundedReceiver<Event>;
 impl Client {
     async fn new(token: &str) -> LibResult<Client> {
         Ok(Client {
+            sender: Mutex::new(None),
             token: token.to_string(),
         })
     }
@@ -87,12 +93,14 @@ impl Client {
                 .map_err(|_| Error::InvalidToken)?,
         );
         let (tx, rx) = unbounded_channel();
+        self.sender = Mutex::new(Some(tx));
+        let sender = self.sender.lock().expect("sender poisoned").take().unwrap(); // TODO: handle already started -- take() will return None
 
         let (mut ws_stream, _) = connect_async(req).await?;
         tokio::spawn(async move {
             while let Some(message) = ws_stream.next().await {
                 if let Some(event) = Client::parse(message.unwrap()) {
-                    tx.send(event).unwrap();
+                    sender.send(event).unwrap();
                 }
             }
         });
@@ -116,11 +124,44 @@ impl Client {
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     dotenv::dotenv().ok();
+    tracing_subscriber::fmt::init();
 
-    let mut client = Client::new(&std::env::var("GUILDED_BEARER_TOKEN").unwrap()).await?;
+    let token = std::env::var("GUILDED_BEARER_TOKEN").unwrap();
+    let mut client = Client::new(&token).await?;
     let mut events = client.start().await?;
+    debug!("listening");
+    use mtg::http::Client as HttpClient;
+    let http_client = HttpClient::new(&token);
     loop {
-        let event = events.recv().await;
-        println!("{:?}", event);
+        if let Some(Event::ChatMessageCreated { message, .. }) = events.recv().await {
+            let _token = token.clone();
+            let http_client = http_client.clone();
+            tokio::spawn(async move {
+                match mtg::scryfall::search(message.content).await {
+                    Ok(card) => {
+                        let image_url = card.image_uris.map(|c| c.small);
+                        debug!("Found card: {} {:?}", card.name, image_url);
+                        let res = http_client
+                            .create_message(
+                                message.channel_id,
+                                mtg::http::Message {
+                                    embeds: Some(vec![ChatEmbed {
+                                        title: Some(card.name),
+                                        image: Some(UrlWrapper { url: image_url }),
+                                        ..Default::default()
+                                    }]),
+                                    ..Default::default()
+                                },
+                            )
+                            .await;
+                        match res {
+                            Ok(_) => debug!("create_message success"),
+                            Err(err) => error!(?err, "create_message failed"),
+                        }
+                    }
+                    Err(err) => debug!(?err),
+                }
+            });
+        }
     }
 }
