@@ -18,15 +18,43 @@ pub struct ChatEmbed {
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<UrlWrapper>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub footer: Option<ChatEmbedFooter>,
 }
 
-// TODO: impl From<mtg::scryfall::Card>
+#[derive(Serialize, Deserialize, Default)]
+pub struct ChatEmbedFooter {
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon_url: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Default)]
 pub struct Message {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embeds: Option<Vec<ChatEmbed>>,
+}
+
+impl From<crate::scryfall::Card> for Message {
+    fn from(card: crate::scryfall::Card) -> Self {
+        Message {
+            embeds: Some(vec![ChatEmbed {
+                title: Some(card.name),
+                url: Some(card.scryfall_uri),
+                image: Some(UrlWrapper {
+                    url: card.image_uris.map(|c| c.small),
+                }),
+                footer: Some(ChatEmbedFooter {
+                    text: "powered by Scryfall API".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Error, Debug)]
@@ -54,8 +82,8 @@ impl Client {
     // TODO: create Id types for ChannelId
     pub async fn create_message(
         &self,
-        channel_id: String,
-        message: Message,
+        channel_id: &String,
+        message: &Message,
     ) -> Result<(), CreateError> {
         let json = serde_json::json!(&message);
         let resp = self
@@ -65,7 +93,7 @@ impl Client {
                 channel_id
             ))
             .header("Authorization", format!("Bearer {}", &self.token))
-            .json(&message)
+            .json(message)
             .send()
             .await?;
         if resp.status() != reqwest::StatusCode::CREATED {

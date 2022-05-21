@@ -1,8 +1,8 @@
 use futures_util::StreamExt;
-use mtg::http::{ChatEmbed, UrlWrapper};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_repr::*;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio_tungstenite::{
@@ -126,32 +126,32 @@ async fn main() -> Result<(), anyhow::Error> {
     dotenv::dotenv().ok();
     tracing_subscriber::fmt::init();
 
+    // Set up Websocket Client for Guilded
     let token = std::env::var("GUILDED_BEARER_TOKEN").unwrap();
     let mut client = Client::new(&token).await?;
     let mut events = client.start().await?;
     debug!("listening");
+
+    // Set up Scryfall API HTTP client
     use mtg::http::Client as HttpClient;
     let http_client = HttpClient::new(&token);
+    let re = Arc::new(Regex::new(r"\[\[(?P<query>.*?)\]\]").unwrap());
+
     loop {
         if let Some(Event::ChatMessageCreated { message, .. }) = events.recv().await {
             let http_client = http_client.clone();
+            let re = re.clone();
             tokio::spawn(async move {
-                match mtg::scryfall::find(&message.content).await {
+                let query = re.captures(&message.content);
+                if query.is_none() {
+                    return;
+                }
+                let query = query.unwrap().name("query").unwrap().as_str();
+                match mtg::scryfall::find(query).await {
                     Ok(Some(card)) => {
-                        let image_url = card.image_uris.map(|c| c.small);
-                        debug!("Found card: {} {:?}", card.name, image_url);
+                        debug!("Found card: {}", &card.name);
                         let res = http_client
-                            .create_message(
-                                message.channel_id,
-                                mtg::http::Message {
-                                    embeds: Some(vec![ChatEmbed {
-                                        title: Some(card.name),
-                                        image: Some(UrlWrapper { url: image_url }),
-                                        ..Default::default()
-                                    }]),
-                                    ..Default::default()
-                                },
-                            )
+                            .create_message(&message.channel_id, &card.into())
                             .await;
                         match res {
                             Ok(_) => debug!("create_message success"),
@@ -159,7 +159,7 @@ async fn main() -> Result<(), anyhow::Error> {
                         }
                     }
                     Ok(None) => {
-                        debug!("found no matching card for {name}", name = &message.content)
+                        debug!(query, "found no matching card")
                     }
                     Err(err) => debug!(?err),
                 }

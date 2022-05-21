@@ -11,6 +11,7 @@ struct SearchResponse {
 pub struct Card {
     pub name: String,
     pub image_uris: Option<ImageUris>,
+    pub scryfall_uri: String,
 }
 
 #[derive(Serialize, Deserialize)]
