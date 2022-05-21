@@ -20,6 +20,7 @@ pub struct ChatEmbed {
     pub image: Option<UrlWrapper>,
 }
 
+// TODO: impl From<mtg::scryfall::Card>
 #[derive(Serialize, Deserialize, Default)]
 pub struct Message {
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -134,11 +134,10 @@ async fn main() -> Result<(), anyhow::Error> {
     let http_client = HttpClient::new(&token);
     loop {
         if let Some(Event::ChatMessageCreated { message, .. }) = events.recv().await {
-            let _token = token.clone();
             let http_client = http_client.clone();
             tokio::spawn(async move {
-                match mtg::scryfall::search(message.content).await {
-                    Ok(card) => {
+                match mtg::scryfall::find(&message.content).await {
+                    Ok(Some(card)) => {
                         let image_url = card.image_uris.map(|c| c.small);
                         debug!("Found card: {} {:?}", card.name, image_url);
                         let res = http_client
@@ -158,6 +157,9 @@ async fn main() -> Result<(), anyhow::Error> {
                             Ok(_) => debug!("create_message success"),
                             Err(err) => error!(?err, "create_message failed"),
                         }
+                    }
+                    Ok(None) => {
+                        debug!("found no matching card for {name}", name = &message.content)
                     }
                     Err(err) => debug!(?err),
                 }

@@ -21,29 +21,41 @@ pub struct ImageUris {
 }
 
 #[derive(Error, Debug)]
-pub enum SearchError {
-    #[error("No matches found for card name {name}")]
-    NoMatch { name: String },
+pub enum ScryfallError {
     #[error("Scryfall API call failed")]
     HttpError(#[from] reqwest::Error),
+    #[error("Scryfall API returned unrecognized status {0}: {1}")]
+    UnknownResponse(reqwest::StatusCode, String),
 }
 
 // TODO: Fix API to make user create a client instead of global
 static CLIENT: OnceCell<reqwest::Client> = OnceCell::new();
 
-// TODO: Refactor to Result<Option<Card>, anyhow::Error>
-pub async fn search(name: String) -> Result<Card, SearchError> {
+pub async fn search(query: &str) -> Result<Option<Vec<Card>>, ScryfallError> {
     let client = CLIENT.get_or_init(reqwest::Client::new);
-    let url = format!("https://api.scryfall.com/cards/search?q={}", name);
-    let response = client
+    let url = format!("https://api.scryfall.com/cards/search?q={}", query);
+    Ok(client
         .get(url)
         .send()
         .await?
         .json::<SearchResponse>()
-        .await?;
+        .await?
+        .data)
+}
 
-    response
-        .data
-        .ok_or(SearchError::NoMatch { name })
-        .map(|mut data| data.swap_remove(0))
+pub async fn find(name: &str) -> Result<Option<Card>, ScryfallError> {
+    let client = CLIENT.get_or_init(reqwest::Client::new);
+    let url = format!("https://api.scryfall.com/cards/named?fuzzy={}", name);
+    let response = client.get(url).send().await?;
+    match response.status() {
+        reqwest::StatusCode::OK => Ok(Some(response.json::<Card>().await?)),
+        reqwest::StatusCode::NOT_FOUND => Ok(None),
+        status => Err(ScryfallError::UnknownResponse(
+            status,
+            response
+                .text()
+                .await
+                .unwrap_or("failed to get response body".to_string()),
+        )),
+    }
 }
