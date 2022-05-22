@@ -8,7 +8,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio_tungstenite::{
     connect_async, tungstenite::client::IntoClientRequest, tungstenite::Message as WsMessage,
 };
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 #[derive(Serialize_repr, Deserialize_repr, PartialEq, Debug)]
 #[repr(u8)]
@@ -99,24 +99,31 @@ impl Client {
         let (mut ws_stream, _) = connect_async(req).await?;
         tokio::spawn(async move {
             while let Some(message) = ws_stream.next().await {
-                if let Some(event) = Client::parse(message.unwrap()) {
-                    sender.send(event).unwrap();
+                match Client::parse(message.unwrap()) {
+                    Ok(Some(event)) => sender.send(event).unwrap(),
+                    Ok(None) => continue,
+                    Err(e) => warn!("Failed to handle an unknown websocket message: {:#?}", e),
                 }
             }
         });
         Ok(rx)
     }
 
-    fn parse(message: tokio_tungstenite::tungstenite::Message) -> Option<Event> {
+    // TODO: split handling of tungstenite::Message's from parsing into Guilded Events
+    fn parse(message: tokio_tungstenite::tungstenite::Message) -> LibResult<Option<Event>> {
         match message {
             WsMessage::Text(message) => {
-                if let Op { op: OpCode::Event } = serde_json::from_str(&message).unwrap() {
-                    Some(serde_json::from_str::<Message>(&message).unwrap().d)
+                if let Op { op: OpCode::Event } = serde_json::from_str(&message)? {
+                    Ok(Some(serde_json::from_str::<Message>(&message)?.d))
                 } else {
-                    None
+                    Ok(None)
                 }
             }
-            _ => None,
+            _ => {
+                // TODO: handle heartbeats, etc
+                debug!("Received websocket message other than Text: {:?}", message);
+                Ok(None)
+            }
         }
     }
 }
