@@ -121,7 +121,7 @@ impl Client {
             }
             _ => {
                 // TODO: handle heartbeats, etc
-                debug!("Received websocket message other than Text: {:?}", message);
+                debug!(ws_message = ?message, "Received websocket message other than Text");
                 Ok(None)
             }
         }
@@ -156,7 +156,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 let query = query.unwrap().name("query").unwrap().as_str();
                 match mtg::scryfall::find(query).await {
                     Ok(Some(card)) => {
-                        debug!("Found card: {}", &card.name);
+                        debug!(?card.name, "found card");
                         let res = http_client
                             .create_message(&message.channel_id, &card.into())
                             .await;
