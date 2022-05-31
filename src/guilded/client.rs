@@ -1,5 +1,5 @@
 use futures_util::StreamExt;
-use std::sync::Mutex;
+use std::{sync::Mutex, time::Duration};
 use thiserror::Error;
 use tokio::{
     net::TcpStream,
@@ -26,51 +26,96 @@ pub struct Client {
     token: String,
 }
 
+#[derive(Debug)]
 enum ProcessorAction {}
 
 struct Processor {
+    token: String,
     events: UnboundedSender<Event>,
-    _controls: UnboundedSender<ProcessorAction>,
     ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
 }
 
+#[derive(Error, Debug)]
+enum HandlingError {
+    #[error("received close frame")]
+    Close,
+}
+
+impl HandlingError {
+    const fn reconnectable(&self) -> bool {
+        match self {
+            HandlingError::Close => true,
+        }
+    }
+}
+
 impl Processor {
-    async fn new(
+    async fn new(token: &str, events: UnboundedSender<Event>) -> Result<Self, ConnectingError> {
+        let ws_stream = Processor::connect(token).await?;
+        Ok(Processor {
+            token: token.to_string(),
+            events,
+            ws_stream,
+        })
+    }
+
+    async fn connect(
         token: &str,
-        events: UnboundedSender<Event>,
-        _controls: UnboundedSender<ProcessorAction>,
-    ) -> Result<Self, ConnectingError> {
+    ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, ConnectingError> {
         let mut req = "wss://api.guilded.gg/v1/websocket"
             .into_client_request()
             .expect("failed to parse websocker uri");
         req.headers_mut().append(
             "Authorization",
-            format!("Bearer {}", token,)
+            format!("Bearer {}", token)
                 .parse()
                 .map_err(|_| ConnectingError::InvalidToken)?,
         );
         debug!("processor attempting to connect to Guilded websocket");
         let (ws_stream, _) = connect_async(req).await?;
         debug!("processor websocket connected successfully");
-
-        Ok(Processor {
-            events,
-            _controls,
-            ws_stream,
-        })
+        Ok(ws_stream)
     }
 
     async fn run(&mut self) {
         while let Some(message) = self.ws_stream.next().await {
-            match message {
-                Ok(message) => self.handle_message(message),
-                Err(_) => todo!(),
+            if let Err(err) = message {
+                warn!(?err, "run received error getting next message from stream");
+                continue;
+            }
+
+            if let Err(err) = self.handle_message(message.unwrap()) {
+                if err.reconnectable() {
+                    self.reconnect().await;
+                    continue;
+                }
             }
         }
 
         // Received a none, this should be interpreted as a force close of the
         // socket and attempt a reconnect
         error!("processor stream ended unexpectedly")
+    }
+
+    async fn reconnect(&mut self) {
+        debug!("attempting to reconnect");
+        let mut wait = Duration::from_secs(1);
+        loop {
+            tokio::time::sleep(wait).await;
+            match Processor::connect(&self.token).await {
+                Ok(ws_stream) => {
+                    debug!("reconnection successful");
+                    self.ws_stream = ws_stream;
+                }
+                Err(err) => {
+                    warn!(?err, "failed to reconnect");
+                    if wait < Duration::from_secs(123) {
+                        wait *= 2
+                    }
+                    continue;
+                }
+            }
+        }
     }
 
     fn handle_event(&self, text: String) {
@@ -93,13 +138,18 @@ impl Processor {
         }
     }
 
-    fn handle_message(&self, message: TsMessage) {
+    fn handle_message(&self, message: TsMessage) -> Result<(), HandlingError> {
         match message {
             TsMessage::Text(text) => self.handle_event(text),
             // TODO: implement client side heartbeats + pong handling
-            TsMessage::Pong(_) => todo!(),
+            TsMessage::Pong(_) => {
+                warn!("received a pong without sending a ping");
+            }
             // TODO: handle receiving close frame from Guilded with reconnect
-            TsMessage::Close(_frame) => todo!(),
+            TsMessage::Close(frame) => {
+                warn!(?frame, "received close frame");
+                return Err(HandlingError::Close);
+            }
             // Ignore Ping, tungstenite will automatically Pong
             TsMessage::Ping(_) => (),
             // Binary message should not be sent by Guilded
@@ -107,6 +157,8 @@ impl Processor {
             // Frame should not be received per tungstenite docs
             TsMessage::Frame(_) => error!("received raw Message::Frame, ignoring"),
         }
+
+        Ok(())
     }
 }
 
