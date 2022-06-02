@@ -181,8 +181,7 @@ impl Client {
             .take()
             .expect("already started"); // TODO: handle already started -- take() will return None
 
-        let (ptx, _prx) = unbounded_channel();
-        let mut processor = Processor::new(&self.token, sender, ptx).await?;
+        let mut processor = Processor::new(&self.token, sender).await?;
         tokio::spawn(async move {
             processor.run().await;
         });
